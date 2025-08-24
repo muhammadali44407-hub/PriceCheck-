@@ -62,7 +62,10 @@ with left:
     with c2:
         max_concurrency = st.slider("Max concurrent requests", min_value=1, max_value=20, value=20)
 
-    upl = st.file_uploader("Upload eBay export (.csv or .xlsx). Must contain **Custom label (SKU)** and **Current price**", type=["csv", "xlsx"])
+    upl = st.file_uploader(
+        "Upload eBay export (.csv or .xlsx). Must contain **Custom label (SKU)** and **Current price**",
+        type=["csv", "xlsx"]
+    )
 
 with right:
     st.subheader("Live log")
@@ -102,7 +105,7 @@ def parse_money(val):
     if isinstance(val, (int, float)):
         return float(val)
     s = str(val)
-    # Remove everything except digits, dot, and comma
+    # Remove everything except digits, dot, comma, minus
     s = re.sub(r"[^0-9\.,-]", "", s)
     if s == "":
         return None
@@ -113,8 +116,6 @@ def parse_money(val):
         # If only comma present, treat comma as decimal separator
         if "," in s and "." not in s:
             s = s.replace(",", ".")
-        else:
-            s = s  # dot decimal already
     try:
         return float(s)
     except:
@@ -139,7 +140,7 @@ def update_progress(done: int, total: int):
     counter_txt.write(f"Processed {done} of {total}")
 
 # =========================
-# Crawlbase
+# Crawlbase fetch
 # =========================
 async def fetch_asin(session: aiohttp.ClientSession, token: str, domain: str, asin: str, sem: asyncio.Semaphore):
     """Fetch single ASIN from Crawlbase (amazon-product-details)."""
@@ -153,7 +154,6 @@ async def fetch_asin(session: aiohttp.ClientSession, token: str, domain: str, as
                 try:
                     data = await resp.json(content_type=None)
                 except Exception as e:
-                    text = await resp.text()
                     return {"_ok": False, "_msg": f"Parse error: {e}", "_asin": asin}
 
                 if isinstance(data, dict) and 'error' in data:
@@ -210,7 +210,7 @@ async def process_batch(token: str, domain: str, asins: list, max_concurrency: i
 # =========================
 # Main
 # =========================
-SHEET_PRICE_COL = "Current price"  # <— change this if your price column has a different name
+SHEET_PRICE_COL = "Current price"  # <— change this if your price column name is different
 
 if upl is not None:
     # Read CSV/XLSX
@@ -260,22 +260,23 @@ if upl is not None:
 
         # Amazon results -> DataFrame
         df_amz = pd.DataFrame(results)
-        fill_cols = ["TITLE","body_html","price","highResolutionImages","Brand","isPrime","inStock","stockDetail"]
-        for c in fill_cols:
+        amz_cols = ["TITLE","body_html","price","highResolutionImages","Brand","isPrime","inStock","stockDetail"]
+        for c in amz_cols:
             if c not in df_amz.columns:
                 df_amz[c] = "not found"
         if "_asin" not in df_amz.columns:
             df_amz["_asin"] = ""
 
-        # Merge onto original rows
+        # Merge onto original rows (left join to keep all original rows)
         df_merge = df_in.merge(
-            df_amz[["_asin"] + fill_cols],
+            df_amz[["_asin"] + amz_cols],
             how="left",
             left_on="ASIN",
             right_on="_asin"
         ).drop(columns=["_asin"])
 
-        for c in fill_cols:
+        # Fill any missing Amazon fields with "not found"
+        for c in amz_cols:
             df_merge[c] = df_merge[c].where(df_merge[c].notna(), "not found")
 
         # ===== Price math =====
@@ -283,8 +284,15 @@ if upl is not None:
         df_merge["SheetPrice"] = df_merge[SHEET_PRICE_COL].apply(parse_money)
 
         # 2) AdjustedPrice = Current price - 11% - 0.30
-        df_merge["AdjustedPrice"] = df_merge["SheetPrice"].apply(
-            lambda x: round((x * 0.89 - 0.30), 2) if x is not None else None
+        def calc_adjusted(x):
+            if x is None:
+                return None, None
+            adj = round((x * 0.89 - 0.30), 2)
+            formula = f"{x} - 11% - 0.30 = {adj}"
+            return adj, formula
+
+        df_merge[["AdjustedPrice","AdjustedPriceFormula"]] = df_merge["SheetPrice"].apply(
+            lambda x: pd.Series(calc_adjusted(x))
         )
 
         # 3) Parse numeric AmazonPrice
@@ -295,21 +303,22 @@ if upl is not None:
             if amz is None or adj is None:
                 return "not found"
             return bool(amz > adj)
+
         df_merge["AmazonHigherThanAdjusted"] = df_merge.apply(
             lambda r: cmp(r["AmazonPrice"], r["AdjustedPrice"]), axis=1
         )
 
         st.success("Done! Preview:")
-        # Show useful columns up front; everything else still included in CSV
         preview_cols = [
             "Custom label (SKU)", "ASIN", SHEET_PRICE_COL, "SheetPrice",
-            "AdjustedPrice", "AmazonPrice", "AmazonHigherThanAdjusted",
+            "AdjustedPrice", "AdjustedPriceFormula",
+            "AmazonPrice", "AmazonHigherThanAdjusted",
             "TITLE", "Brand", "inStock", "isPrime"
         ]
         existing_cols = [c for c in preview_cols if c in df_merge.columns]
         st.dataframe(df_merge[existing_cols].head(20), use_container_width=True)
 
-        # Download enriched CSV
+        # Download enriched CSV (all columns)
         ts_now = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_name = f"{os.path.splitext(upl.name)[0]}_ENRICHED_{ts_now}.csv"
         csv_bytes = df_merge.to_csv(index=False).encode("utf-8")
